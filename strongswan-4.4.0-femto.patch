@@ -1,0 +1,622 @@
+This patch adds an authentication method specific to Alcatel-Lucent 936x femtocells
+to StrongSwan version 4.4.0.
+
+After applying the patch, do the autotools motions with
+$ autoreconf -vfi
+
+Then proceed to
+$ ./configure --enable-eap-femto-ds2460 ...
+$ make
+$ sudo make install
+
+The patch also fixes "build issues" with this StrongSwan version.
+
+diff -Naur strongswan-4.4.0/configure.in strongswan-4.4.0-femto/configure.in
+--- strongswan-4.4.0/configure.in	2010-05-01 22:16:36.000000000 +0200
++++ strongswan-4.4.0-femto/configure.in	2019-08-01 15:14:32.000000000 +0200
+@@ -106,6 +106,7 @@
+ ARG_ENABL_SET([eap-identity],   [enable EAP module providing EAP-Identity helper.])
+ ARG_ENABL_SET([eap-md5],        [enable EAP MD5 (CHAP) authenication module.])
+ ARG_ENABL_SET([eap-gtc],        [enable PAM based EAP GTC authenication module.])
++ARG_ENABL_SET([eap-femto-ds2460],     [enable EAP Femto DS2460B authentication module.])
+ ARG_ENABL_SET([eap-aka],        [enable EAP AKA authentication module.])
+ ARG_ENABL_SET([eap-aka-3gpp2],  [enable EAP AKA backend implementing 3GPP2 algorithms in software. Requires libgmp.])
+ ARG_ENABL_SET([eap-mschapv2],   [enable EAP MS-CHAPv2 authenication module.])
+@@ -818,6 +819,7 @@
+ AM_CONDITIONAL(USE_EAP_IDENTITY, test x$eap_identity = xtrue)
+ AM_CONDITIONAL(USE_EAP_MD5, test x$eap_md5 = xtrue)
+ AM_CONDITIONAL(USE_EAP_GTC, test x$eap_gtc = xtrue)
++AM_CONDITIONAL(USE_EAP_FEMTO_DS2460B, test x$eap_femto_ds2460 = xtrue)
+ AM_CONDITIONAL(USE_EAP_AKA, test x$eap_aka = xtrue)
+ AM_CONDITIONAL(USE_EAP_AKA_3GPP2, test x$eap_aka_3gpp2 = xtrue)
+ AM_CONDITIONAL(USE_EAP_MSCHAPV2, test x$eap_mschapv2 = xtrue)
+@@ -918,6 +920,7 @@
+ 	src/whack/Makefile
+ 	src/charon/Makefile
+ 	src/libcharon/Makefile
++	src/libcharon/plugins/eap_femto_Ds2460/Makefile
+ 	src/libcharon/plugins/eap_aka/Makefile
+ 	src/libcharon/plugins/eap_aka_3gpp2/Makefile
+ 	src/libcharon/plugins/eap_identity/Makefile
+diff -Naur strongswan-4.4.0/src/libcharon/Makefile.am strongswan-4.4.0-femto/src/libcharon/Makefile.am
+--- strongswan-4.4.0/src/libcharon/Makefile.am	2010-04-29 21:21:03.000000000 +0200
++++ strongswan-4.4.0-femto/src/libcharon/Makefile.am	2019-08-01 16:06:26.000000000 +0200
+@@ -287,6 +287,14 @@
+ endif
+ endif
+ 
++if USE_EAP_FEMTO_DS2460B
++  SUBDIRS += plugins/eap_femto_Ds2460
++  PLUGINS += eap-femto-Ds2460
++if MONOLITHIC
++  libcharon_la_LIBADD += plugins/eap_femto_Ds2460/libstrongswan-eap-femto-DS2460B.la
++endif
++endif
++
+ if USE_EAP_AKA
+   SUBDIRS += plugins/eap_aka
+   PLUGINS += eap-aka
+diff -Naur strongswan-4.4.0/src/libcharon/plugins/eap_femto_Ds2460/eap_femto_Ds2460_plugin.c strongswan-4.4.0-femto/src/libcharon/plugins/eap_femto_Ds2460/eap_femto_Ds2460_plugin.c
+--- strongswan-4.4.0/src/libcharon/plugins/eap_femto_Ds2460/eap_femto_Ds2460_plugin.c	1970-01-01 01:00:00.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/plugins/eap_femto_Ds2460/eap_femto_Ds2460_plugin.c	2019-08-02 12:19:23.000000000 +0200
+@@ -0,0 +1,428 @@
++// Remember to run:
++// $ autoreconf -vfi
++// after patchin in
++
++#include <library.h>
++#include <daemon.h>
++#include <plugins/plugin.h>
++#include <sa/authenticators/eap/eap_method.h>
++#include <crypto/hashers/hasher.h>
++
++static const u_int8_t secret0[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
++static const u_int8_t secret1[8] = { 8, 9, 10, 11, 12, 13, 14, 15 };
++
++static void ds2460b_hash(const u_int8_t *text, const u_int8_t *secret, u_int8_t *hash)
++{
++    hasher_t *hasher;
++    u_int8_t mactext[55];
++    chunk_t hash_chunk;
++
++    memcpy(&mactext[ 0], &secret[0], 4);
++    memcpy(&mactext[ 4], &text[0], 44);
++    memcpy(&mactext[48], &secret[4], 4);
++    memcpy(&mactext[52], &text[44], 3);
++    hasher = lib->crypto->create_hasher(lib->crypto, HASH_SHA1);
++    hasher->allocate_hash(hasher, chunk_create((void *)mactext, 55), &hash_chunk);
++    hasher->destroy(hasher);
++
++    memcpy(hash, hash_chunk.ptr, hash_chunk.len);
++}
++
++static void generate_digest(const u_int8_t *nonceA, const u_int8_t *nonceB, u_int8_t *digest)
++{
++    u_int8_t challenge[47];
++    u_int8_t temp[HASH_SIZE_SHA1];
++
++    memcpy(&challenge[ 0], &nonceA[0], 21);
++    memcpy(&challenge[21], &nonceB[0], 21);
++    memset(&challenge[42], 0, 5);
++    ds2460b_hash(challenge, secret0, temp);
++
++    memcpy(&challenge[ 0], &temp[0], HASH_SIZE_SHA1); // can be removed?
++    memcpy(&challenge[20], &nonceA[21], 11);
++    memcpy(&challenge[31], &nonceB[21], 11);
++    memset(&challenge[42], 0, 5); // can be removed?
++    ds2460b_hash(challenge, secret1, digest);
++}
++
++static void generate_msk(const u_int8_t *peerDigest, const u_int8_t *serverDigest, u_int8_t *msk)
++{
++    u_int8_t challenge[47];
++    u_int8_t chain0[20];
++    u_int8_t chain1[20];
++    int i;
++
++    memcpy(&chain1[0], serverDigest, HASH_SIZE_SHA1);
++    for (i = 0; i < 64; i += 16) {
++        memcpy(&challenge[ 0], peerDigest, HASH_SIZE_SHA1);
++        memcpy(&challenge[20], &chain1[0], HASH_SIZE_SHA1);
++        memset(&challenge[40], 0, 7);
++        ds2460b_hash(challenge, secret0, &chain0[0]);
++
++        memcpy(&challenge[ 0], peerDigest, HASH_SIZE_SHA1);
++        memcpy(&challenge[20], &chain0[0], HASH_SIZE_SHA1);
++        memset(&challenge[40], 0, 7);
++        ds2460b_hash(challenge, secret1, &chain1[0]);
++
++        memcpy(&msk[i], &chain1[0], 16);
++    }
++}
++
++/*
++ * Over-the-wire structures
++ */
++
++struct eap_femto_Ds2460_header_t {
++    /** EAP code (REQUEST/RESPONSE) */
++    u_int8_t code;
++    /** unique message identifier */
++    u_int8_t identifier;
++    /** length of whole message */
++    u_int16_t length;
++    u_int8_t method_id[8];
++    u_int8_t msgCode;
++} __attribute__((__packed__));
++typedef struct eap_femto_Ds2460_header_t eap_femto_Ds2460_header_t;
++
++static const u_int8_t EAP_FEMTO_Ds2460b[8] = {0xFE, 0, 3, 0x3F, 0, 0, 0, 1};
++
++#define EAP_FEMTO_DS2460_NONCE_LENGTH 32
++
++struct eap_femto_Ds2460_payload1_t {
++    u_int8_t serverNonce[EAP_FEMTO_DS2460_NONCE_LENGTH];
++};
++
++struct eap_femto_Ds2460_payload2_t {
++    u_int8_t peerNonce[EAP_FEMTO_DS2460_NONCE_LENGTH];
++    u_int8_t peerDigest[HASH_SIZE_SHA1];
++};
++
++struct eap_femto_Ds2460_payload3_t {
++    u_int8_t serverDigest[HASH_SIZE_SHA1];
++};
++
++struct eap_femto_Ds2460_payload4_t {
++    u_int8_t flag;
++};
++
++struct eap_femto_Ds2460_message_t {
++    eap_femto_Ds2460_header_t header;
++    union {
++        struct eap_femto_Ds2460_payload1_t p1;
++        struct eap_femto_Ds2460_payload2_t p2;
++        struct eap_femto_Ds2460_payload3_t p3;
++        struct eap_femto_Ds2460_payload4_t p4;
++    } u;
++};
++typedef struct eap_femto_Ds2460_message_t eap_femto_Ds2460_message_t;
++
++/*
++ * Authentication method functions
++ */
++
++typedef struct eap_femto_Ds2460_method_t eap_femto_Ds2460_method_t;
++struct eap_femto_Ds2460_method_t {
++    eap_method_t interface;
++    identification_t *server_id;
++    identification_t *peer_id;
++    u_int8_t serverNonce[EAP_FEMTO_DS2460_NONCE_LENGTH];
++    u_int8_t peerNonce[EAP_FEMTO_DS2460_NONCE_LENGTH];
++    u_int8_t serverDigest[EAP_FEMTO_DS2460_NONCE_LENGTH];
++    u_int8_t peerDigest[EAP_FEMTO_DS2460_NONCE_LENGTH];
++    int attempts;
++    u_int8_t identifier;
++    uint8_t authenticated;
++};
++
++static eap_type_t get_type(eap_femto_Ds2460_method_t *this, u_int32_t *vendor)
++{
++    *vendor = 0x33F;
++    return EAP_IDENTITY;
++}
++
++static bool is_mutual(eap_femto_Ds2460_method_t *this)
++{
++    return TRUE;
++}
++
++static void generate_nonce(void *nonce)
++{
++    rng_t *rng;
++    chunk_t nonce_chunk;
++    rng = lib->crypto->create_rng(lib->crypto, RNG_WEAK);
++    if (!rng) {
++        DBG1(DBG_IKE, "eap_FemtoDs2460b: unable to create randomizer");
++        memset(nonce, 0xEE, EAP_FEMTO_DS2460_NONCE_LENGTH);
++        return;
++    }
++    rng->allocate_bytes(rng, EAP_FEMTO_DS2460_NONCE_LENGTH, &nonce_chunk);
++    memcpy(nonce, nonce_chunk.ptr, EAP_FEMTO_DS2460_NONCE_LENGTH);
++    rng->destroy(rng);
++}
++
++static status_t server_initiate(eap_femto_Ds2460_method_t *this, eap_payload_t **out)
++{
++    eap_femto_Ds2460_message_t out_msg;
++    size_t payload_length;
++    chunk_t payload;
++
++    out_msg.header.code = EAP_REQUEST;
++    out_msg.header.identifier = this->identifier;
++    memcpy(out_msg.header.method_id, EAP_FEMTO_Ds2460b, 8);
++    out_msg.header.msgCode = 1;
++    payload_length = sizeof(out_msg.header) + sizeof(out_msg.u.p1);
++    out_msg.header.length = htons(payload_length);
++    generate_nonce(this->serverNonce);
++    memcpy(out_msg.u.p1.serverNonce, this->serverNonce, EAP_FEMTO_DS2460_NONCE_LENGTH);
++
++    payload = chunk_create((void *)&out_msg, payload_length);
++    if (2) {
++        DBG1(DBG_IKE, "eap_FemtoDs2460b: generated payload: %B", &payload);
++    }
++    *out = eap_payload_create_data(payload);
++    return NEED_MORE;
++}
++
++static status_t peer_initiate(eap_femto_Ds2460_method_t *this, eap_payload_t **out)
++{
++    return FAILED;
++}
++
++static status_t server_process(eap_femto_Ds2460_method_t *this, eap_payload_t *in, eap_payload_t **out)
++{
++    chunk_t in_data;
++    const eap_femto_Ds2460_message_t *in_msg;
++    eap_femto_Ds2460_message_t out_msg;
++    size_t payload_length;
++    chunk_t payload;
++
++    in_data = in->get_data(in);
++    if (in_data.len < sizeof(eap_femto_Ds2460_header_t)) {
++        DBG1(DBG_IKE, "eap_FemtoDs2460b: message too short");
++        return FAILED;
++    }
++    if (2) {
++        DBG1(DBG_IKE, "eap_FemtoDs2460b: received payload: %B", &in_data);
++    }
++    in_msg = (const eap_femto_Ds2460_message_t *)in_data.ptr;
++
++    out_msg.header.code = EAP_REQUEST;
++    out_msg.header.identifier = this->identifier;
++    memcpy(out_msg.header.method_id, EAP_FEMTO_Ds2460b, 8);
++
++    if (in_msg->header.msgCode == 2) {
++        if (in_data.len != sizeof(in_msg->header) + sizeof(in_msg->u.p2)) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: wrong size %u", in_data.len);
++            return FAILED;
++        }
++
++        if (this->attempts == 0) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: too many attempts");
++            return FAILED;
++        }
++        --this->attempts;
++
++        memcpy(this->peerNonce, in_msg->u.p2.peerNonce, EAP_FEMTO_DS2460_NONCE_LENGTH);
++        generate_digest(this->serverNonce, this->peerNonce, this->peerDigest);
++        if (2) {
++            chunk_t tmp;
++            tmp = chunk_create((void *)this->serverNonce, EAP_FEMTO_DS2460_NONCE_LENGTH);
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: server nonce: %B", &tmp);
++            tmp = chunk_create((void *)this->peerNonce, EAP_FEMTO_DS2460_NONCE_LENGTH);
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: peer nonce: %B", &tmp);
++            tmp = chunk_create((void *)this->peerDigest, HASH_SIZE_SHA1);
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: computed peer digest: %B", &tmp);
++            tmp = chunk_create((void *)in_msg->u.p2.peerDigest, HASH_SIZE_SHA1);
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: received peer digest: %B", &tmp);
++        }
++        if (memcmp(this->peerDigest, in_msg->u.p2.peerDigest, HASH_SIZE_SHA1) != 0) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: peer response does not match expected value");
++            return FAILED;
++        }
++
++        out_msg.header.msgCode = 3;
++        payload_length = sizeof(out_msg.header) + sizeof(out_msg.u.p3);
++        out_msg.header.length = htons(payload_length);
++        generate_digest(this->peerNonce, this->serverNonce, this->serverDigest);
++        memcpy(out_msg.u.p3.serverDigest, this->serverDigest, HASH_SIZE_SHA1);
++
++        payload = chunk_create((void *)&out_msg, payload_length);
++        if (2) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: generated payload: %B", &payload);
++        }
++        *out = eap_payload_create_data(payload);
++        return NEED_MORE;
++    }
++
++    else if (in_msg->header.msgCode == 4) {
++        if (in_data.len != sizeof(in_msg->header) + sizeof(in_msg->u.p4)) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: wrong size %u", in_data.len);
++            return FAILED;
++        }
++
++        this->authenticated = TRUE;
++        return SUCCESS;
++    }
++
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: unknown MsgCode %hhu", in_msg->header.msgCode);
++    return FAILED;
++}
++
++static status_t peer_process(eap_femto_Ds2460_method_t *this, eap_payload_t *in, eap_payload_t **out)
++{
++    chunk_t in_data;
++    const eap_femto_Ds2460_message_t *in_msg;
++    eap_femto_Ds2460_message_t out_msg;
++    size_t payload_length;
++
++    in_data = in->get_data(in);
++    if (in_data.len < sizeof(eap_femto_Ds2460_header_t)) {
++        DBG1(DBG_IKE, "eap_FemtoDs2460b: message too short");
++        return FAILED;
++    }
++    in_msg = (const eap_femto_Ds2460_message_t *)in_data.ptr;
++    out_msg.header.code = EAP_RESPONSE;
++    out_msg.header.identifier = in_msg->header.identifier;
++    memcpy(out_msg.header.method_id, EAP_FEMTO_Ds2460b, 8);
++
++    if (in_msg->header.msgCode == 1) {
++        if (in_data.len != sizeof(in_msg->header) + sizeof(in_msg->u.p1)) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: wrong size %u", in_data.len);
++            return FAILED;
++        }
++
++        if (this->attempts == 0) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: too many attempts");
++            return FAILED;
++        }
++        --this->attempts;
++
++        memcpy(this->serverNonce, in_msg->u.p1.serverNonce, EAP_FEMTO_DS2460_NONCE_LENGTH);
++
++        out_msg.header.msgCode = 2;
++        payload_length = sizeof(out_msg.header) + sizeof(out_msg.u.p2);
++        out_msg.header.length = htons(payload_length);
++        generate_nonce(this->peerNonce);
++        memcpy(out_msg.u.p2.peerNonce, this->peerNonce, EAP_FEMTO_DS2460_NONCE_LENGTH);
++        generate_digest(this->serverNonce, this->peerNonce, this->peerDigest);
++        memcpy(out_msg.u.p2.peerDigest, this->peerDigest, HASH_SIZE_SHA1);
++
++        *out = eap_payload_create_data(chunk_create((void *)&out_msg, payload_length));
++        return NEED_MORE;
++    }
++
++    else if (in_msg->header.msgCode == 3) {
++        if (in_data.len != sizeof(in_msg->header) + sizeof(in_msg->u.p3)) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: wrong size %u", in_data.len);
++            return FAILED;
++        }
++
++        generate_digest(this->peerNonce, this->serverNonce, this->serverDigest);
++        if (memcmp(this->serverDigest, in_msg->u.p3.serverDigest, HASH_SIZE_SHA1) != 0) {
++            DBG1(DBG_IKE, "eap_FemtoDs2460b: server response does not match expected value");
++            return FAILED;
++        }
++        this->authenticated = TRUE;
++        out_msg.header.msgCode = 4;
++        payload_length = sizeof(out_msg.header) + sizeof(out_msg.u.p4);
++        out_msg.header.length = htons(payload_length);
++        out_msg.u.p4.flag = 1;
++
++        *out = eap_payload_create_data(chunk_create((void *)&out_msg, payload_length));
++        return NEED_MORE;
++    }
++
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: unknown MsgCode %hhu", in_msg->header.msgCode);
++    return FAILED;
++}
++
++static status_t get_msk(eap_femto_Ds2460_method_t *this, chunk_t *msk)
++{
++    if (!this->authenticated) {
++        return FAILED;
++    }
++
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: MSK requested");
++    // use peer and server digests to create the msk
++    *msk = chunk_alloc(64);
++    generate_msk(this->peerDigest, this->serverDigest, msk->ptr);
++    if (2) {
++        DBG1(DBG_IKE, "eap_FemtoDs2460b: MSK generated: %B", msk);
++    }
++    return SUCCESS;
++}
++
++static void method_destroy(eap_femto_Ds2460_method_t *this)
++{
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: method being destroyed");
++    this->peer_id->destroy(this->peer_id);
++    this->server_id->destroy(this->server_id);
++    free(this);
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: method destroyed");
++}
++
++static eap_femto_Ds2460_method_t *create_generic(identification_t *server, identification_t *peer)
++{
++    eap_femto_Ds2460_method_t *this = malloc_thing(eap_femto_Ds2460_method_t);
++
++    this->interface.initiate = NULL;
++    this->interface.process = NULL;
++    this->interface.get_type = (eap_type_t(*)(eap_method_t*,u_int32_t*))get_type;
++    this->interface.is_mutual = (bool(*)(eap_method_t*))is_mutual;
++    this->interface.get_msk = (status_t(*)(eap_method_t*,chunk_t*))get_msk;
++    this->interface.destroy = (void(*)(eap_method_t*))method_destroy;
++	this->peer_id = peer->clone(peer);
++	this->server_id = server->clone(server);
++    this->attempts = 10;
++
++    return this;
++}
++
++static eap_method_t *eap_femto_Ds2460_server_create(identification_t *server, identification_t *peer)
++{
++    eap_femto_Ds2460_method_t *this = create_generic(server, peer);
++    this->interface.initiate = (status_t(*)(eap_method_t*,eap_payload_t**))server_initiate;
++    this->interface.process = (status_t(*)(eap_method_t*,eap_payload_t*,eap_payload_t**))server_process;
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: server created");
++    return &this->interface;
++}
++
++static eap_method_t *eap_femto_Ds2460_peer_create(identification_t *server, identification_t *peer)
++{
++    eap_femto_Ds2460_method_t *this = create_generic(server, peer);
++    this->interface.initiate = (status_t(*)(eap_method_t*,eap_payload_t**))peer_initiate;
++    this->interface.process = (status_t(*)(eap_method_t*,eap_payload_t*,eap_payload_t**))peer_process;
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: peer created");
++    return &this->interface;
++}
++
++/*
++ * Plugin implementation
++ */
++
++typedef struct eap_femto_Ds2460_plugin_t eap_femto_Ds2460_plugin_t;
++struct eap_femto_Ds2460_plugin_t {
++    plugin_t plugin;
++};
++
++static void plugin_destroy(eap_femto_Ds2460_plugin_t *this)
++{
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: plugin being destroyed");
++    charon->eap->remove_method(charon->eap, (eap_constructor_t)eap_femto_Ds2460_server_create);
++    charon->eap->remove_method(charon->eap, (eap_constructor_t)eap_femto_Ds2460_peer_create);
++    free(this);
++    DBG1(DBG_IKE, "eap_FemtoDs2460b: plugin destroyed");
++}
++
++plugin_t *eap_femto_Ds2460_plugin_create()
++{
++    eap_femto_Ds2460_plugin_t *this = malloc_thing(eap_femto_Ds2460_plugin_t);
++
++    this->plugin.destroy = (void(*)(plugin_t*))plugin_destroy;
++
++    charon->eap->add_method(charon->eap, EAP_IDENTITY, 0x33F, EAP_SERVER, (eap_constructor_t)eap_femto_Ds2460_server_create);
++    charon->eap->add_method(charon->eap, EAP_IDENTITY, 0x33F, EAP_PEER, (eap_constructor_t)eap_femto_Ds2460_peer_create);
++
++    return &this->plugin;
++}
++
+diff -Naur strongswan-4.4.0/src/libcharon/plugins/eap_femto_Ds2460/Makefile.am strongswan-4.4.0-femto/src/libcharon/plugins/eap_femto_Ds2460/Makefile.am
+--- strongswan-4.4.0/src/libcharon/plugins/eap_femto_Ds2460/Makefile.am	1970-01-01 01:00:00.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/plugins/eap_femto_Ds2460/Makefile.am	2019-08-01 14:19:58.000000000 +0200
+@@ -0,0 +1,17 @@
++
++INCLUDES = -I$(top_srcdir)/src/libstrongswan \
++	-I$(top_srcdir)/src/libhydra \
++	-I$(top_srcdir)/src/libcharon
++
++AM_CFLAGS = -rdynamic
++
++if MONOLITHIC
++noinst_LTLIBRARIES = libstrongswan-eap-femto-DS2460B.la
++else
++plugin_LTLIBRARIES = libstrongswan-eap-femto-DS2460B.la
++endif
++
++libstrongswan_eap_femto_DS2460B_la_SOURCES = \
++	eap_femto_Ds2460_plugin.c
++
++libstrongswan_eap_femto_DS2460B_la_LDFLAGS = -module -avoid-version
+diff -Naur strongswan-4.4.0/src/pluto/keys.h strongswan-4.4.0-femto/src/pluto/keys.h
+--- strongswan-4.4.0/src/pluto/keys.h	2010-03-15 21:52:51.000000000 +0100
++++ strongswan-4.4.0-femto/src/pluto/keys.h	2022-04-15 20:18:43.000000000 +0200
+@@ -26,7 +26,7 @@
+ # define SHARED_SECRETS_FILE  IPSEC_CONFDIR "/ipsec.secrets"
+ #endif
+ 
+-const char *shared_secrets_file;
++extern const char *shared_secrets_file;
+ 
+ extern void load_preshared_secrets(int whackfd);
+ extern void free_preshared_secrets(void);
+diff -Naur strongswan-4.4.0/src/libhydra/attributes/mem_pool.c strongswan-4.4.0-femto/src/libhydra/attributes/mem_pool.c
+--- strongswan-4.4.0/src/libhydra/attributes/mem_pool.c	2010-04-07 13:05:17.000000000 +0200
++++ strongswan-4.4.0-femto/src/libhydra/attributes/mem_pool.c	2022-04-15 20:18:43.000000000 +0200
+@@ -16,6 +16,7 @@
+ 
+ #include "mem_pool.h"
+ 
++#include <stdint.h>
+ #include <debug.h>
+ #include <utils/hashtable.h>
+ #include <threading/rwlock.h>
+diff -Naur strongswan-4.4.0/src/libcharon/plugins/kernel_netlink/kernel_netlink_net.c strongswan-4.4.0-femto/src/libcharon/plugins/kernel_netlink/kernel_netlink_net.c
+--- strongswan-4.4.0/src/libcharon/plugins/kernel_netlink/kernel_netlink_net.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/plugins/kernel_netlink/kernel_netlink_net.c	2022-04-15 20:18:44.000000000 +0200
+@@ -43,6 +43,7 @@
+ #include <unistd.h>
+ #include <errno.h>
+ #include <net/if.h>
++#include <stdint.h>
+ 
+ #include "kernel_netlink_net.h"
+ #include "kernel_netlink_shared.h"
+diff -Naur strongswan-4.4.0/src/libcharon/plugins/stroke/stroke_control.c strongswan-4.4.0-femto/src/libcharon/plugins/stroke/stroke_control.c
+--- strongswan-4.4.0/src/libcharon/plugins/stroke/stroke_control.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/plugins/stroke/stroke_control.c	2022-04-15 20:18:44.000000000 +0200
+@@ -15,6 +15,7 @@
+ 
+ #include "stroke_control.h"
+ 
++#include <stdint.h>
+ #include <daemon.h>
+ #include <processing/jobs/delete_ike_sa_job.h>
+ 
+diff -Naur strongswan-4.4.0/src/libcharon/plugins/stroke/stroke_list.c strongswan-4.4.0-femto/src/libcharon/plugins/stroke/stroke_list.c
+--- strongswan-4.4.0/src/libcharon/plugins/stroke/stroke_list.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/plugins/stroke/stroke_list.c	2022-04-15 20:18:44.000000000 +0200
+@@ -16,6 +16,7 @@
+ #include "stroke_list.h"
+ 
+ #include <time.h>
++#include <stdint.h>
+ 
+ #include <daemon.h>
+ #include <utils/linked_list.h>
+diff -Naur strongswan-4.4.0/src/libcharon/config/auth_cfg.c strongswan-4.4.0-femto/src/libcharon/config/auth_cfg.c
+--- strongswan-4.4.0/src/libcharon/config/auth_cfg.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/config/auth_cfg.c	2022-04-15 20:18:44.000000000 +0200
+@@ -16,6 +16,7 @@
+ 
+ #include "auth_cfg.h"
+ 
++#include <stdint.h>
+ #include <daemon.h>
+ #include <utils/linked_list.h>
+ #include <utils/identification.h>
+diff -Naur strongswan-4.4.0/src/libcharon/config/child_cfg.c strongswan-4.4.0-femto/src/libcharon/config/child_cfg.c
+--- strongswan-4.4.0/src/libcharon/config/child_cfg.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/config/child_cfg.c	2022-04-15 20:18:44.000000000 +0200
+@@ -18,6 +18,7 @@
+ #include "child_cfg.h"
+ 
+ #include <daemon.h>
++#include <stdint.h>
+ 
+ ENUM(action_names, ACTION_NONE, ACTION_RESTART,
+ 	"clear",
+diff -Naur strongswan-4.4.0/src/libcharon/sa/authenticators/authenticator.c strongswan-4.4.0-femto/src/libcharon/sa/authenticators/authenticator.c
+--- strongswan-4.4.0/src/libcharon/sa/authenticators/authenticator.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/sa/authenticators/authenticator.c	2022-04-15 20:18:44.000000000 +0200
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include <string.h>
++#include <stdint.h>
+ 
+ #include "authenticator.h"
+ 
+diff -Naur strongswan-4.4.0/src/libcharon/sa/authenticators/eap_authenticator.c strongswan-4.4.0-femto/src/libcharon/sa/authenticators/eap_authenticator.c
+--- strongswan-4.4.0/src/libcharon/sa/authenticators/eap_authenticator.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/sa/authenticators/eap_authenticator.c	2022-04-15 20:18:44.000000000 +0200
+@@ -15,6 +15,7 @@
+ 
+ #include "eap_authenticator.h"
+ 
++#include <stdint.h>
+ #include <daemon.h>
+ #include <sa/authenticators/eap/eap_method.h>
+ #include <encoding/payloads/auth_payload.h>
+diff -Naur strongswan-4.4.0/src/libcharon/sa/tasks/ike_auth.c strongswan-4.4.0-femto/src/libcharon/sa/tasks/ike_auth.c
+--- strongswan-4.4.0/src/libcharon/sa/tasks/ike_auth.c	2010-03-19 16:56:54.000000000 +0100
++++ strongswan-4.4.0-femto/src/libcharon/sa/tasks/ike_auth.c	2022-04-15 20:18:44.000000000 +0200
+@@ -17,6 +17,7 @@
+ #include "ike_auth.h"
+ 
+ #include <string.h>
++#include <stdint.h>
+ 
+ #include <daemon.h>
+ #include <encoding/payloads/id_payload.h>
